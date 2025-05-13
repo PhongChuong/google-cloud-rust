@@ -38,6 +38,8 @@ func updateMethodPagination(a *api.API) {
 		var hasPageSize bool
 		var hasPageToken *api.Field
 		for _, f := range reqMsg.Fields {
+			// TODO(NOW): Update to support wrapped types.
+
 			// Some legacy services (e.g. sqladmin.googleapis.com)
 			// predate AIP-4233 and use `maxResults` instead of
 			// `pageSize` for the field name.
