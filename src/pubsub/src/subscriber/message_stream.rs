@@ -328,11 +328,22 @@ impl MessageStreamImpl {
             StreamState::Closed => return None,
             StreamState::Active(s) => s,
         };
-        stream
-            .next_message()
-            .await
-            .map_err(to_gax_error)
-            .transpose()
+        let timeout_token = stream.timeout_token.clone();
+        tokio::select! {
+            _ = timeout_token.cancelled() => {
+                let mut status = google_cloud_gax::error::rpc::Status::default();
+                status.code = google_cloud_gax::error::rpc::Code::Unavailable;
+                status.message = "keepalive server timeout".to_string();
+                Some(Err(Error::service(status)))
+            }
+            res = async { stream.next_message().await.map_err(to_gax_error).transpose() } => {
+                if let Some(Ok(_)) = &res {
+                    let now_secs = tokio::time::Instant::now().duration_since(stream.anchor).as_secs();
+                    stream.last_server_response_time.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                }
+                res
+            }
+        }
     }
 
     /// Populate the message pool by reading from the stream.

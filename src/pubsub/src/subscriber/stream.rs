@@ -26,6 +26,7 @@ use google_cloud_gax::retry_throttler::CircuitBreaker;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub(super) const INITIAL_DELAY: Duration = Duration::from_millis(100);
@@ -44,6 +45,11 @@ where
 
     /// The stream.
     pub(super) stream: <T as Stub>::Stream,
+
+    pub(super) last_client_ping_time: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) last_server_response_time: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) anchor: Instant,
+    pub(super) timeout_token: CancellationToken,
 }
 
 impl<T> TonicStreaming for Stream<T>
@@ -114,8 +120,40 @@ where
     // being idle for ~90s, leading to unnecessary retries.
     //
     // [^1]: https://github.com/hyperium/tonic/issues/515
+    let anchor = Instant::now();
+    let last_client_ping_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_server_response_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let timeout_token = CancellationToken::new();
+
     let shutdown = CancellationToken::new();
-    keepalive::spawn(request_tx, shutdown.clone());
+    keepalive::spawn(
+        request_tx,
+        shutdown.clone(),
+        last_client_ping_time.clone(),
+        anchor,
+    );
+
+    let last_client_ping = last_client_ping_time.clone();
+    let last_server_resp = last_server_response_time.clone();
+    let timeout_tok = timeout_token.clone();
+    let monitor_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            tokio::select! {
+                _ = monitor_shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    let ping = last_client_ping.load(std::sync::atomic::Ordering::Relaxed);
+                    let resp = last_server_resp.load(std::sync::atomic::Ordering::Relaxed);
+                    let current_time = Instant::now().duration_since(anchor).as_secs();
+                    if ping > resp && (current_time >= ping && current_time - ping >= 15) {
+                        timeout_tok.cancel();
+                        break;
+                    }
+                }
+            }
+        }
+    });
 
     let stream = inner
         .streaming_pull(&request_params, request_rx, RequestOptions::default())
@@ -125,6 +163,10 @@ where
     Ok(Stream {
         _keepalive_guard: shutdown.drop_guard(),
         stream,
+        last_client_ping_time,
+        last_server_response_time,
+        anchor,
+        timeout_token,
     })
 }
 
