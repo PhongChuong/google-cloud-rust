@@ -42,6 +42,12 @@ where
     /// have a custom `impl Drop for Stream`.
     _keepalive_guard: DropGuard,
 
+    /// Token to signal keepalive timeout.
+    pub(super) shutdown: CancellationToken,
+
+    /// Timestamp of the last received response.
+    pub(super) last_response_time: Arc<std::sync::Mutex<tokio::time::Instant>>,
+
     /// The stream.
     pub(super) stream: <T as Stub>::Stream,
 }
@@ -52,7 +58,19 @@ where
     <T as Stub>::Stream: TonicStreaming,
 {
     async fn next_message(&mut self) -> TonicResult<Option<StreamingPullResponse>> {
-        self.stream.next_message().await
+        tokio::select! {
+            res = self.stream.next_message() => {
+                if let Ok(Some(_)) = &res {
+                    if let Ok(mut last) = self.last_response_time.lock() {
+                        *last = tokio::time::Instant::now();
+                    }
+                }
+                res
+            }
+            _ = self.shutdown.cancelled() => {
+                Err(gaxi::grpc::tonic::Status::unavailable("Keepalive timeout"))
+            }
+        }
     }
 }
 
@@ -117,13 +135,36 @@ where
     let shutdown = CancellationToken::new();
     keepalive::spawn(request_tx, shutdown.clone());
 
+    let last_response_time = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+    let monitor_last_response = last_response_time.clone();
+    let monitor_shutdown = shutdown.clone();
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            tokio::select! {
+                _ = monitor_shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    if let Ok(last) = monitor_last_response.lock() {
+                        if last.elapsed() > Duration::from_secs(15) {
+                            monitor_shutdown.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     let stream = inner
         .streaming_pull(&request_params, request_rx, RequestOptions::default())
         .await?
         .into_inner();
 
     Ok(Stream {
-        _keepalive_guard: shutdown.drop_guard(),
+        _keepalive_guard: shutdown.clone().drop_guard(),
+        shutdown,
+        last_response_time,
         stream,
     })
 }
@@ -153,7 +194,6 @@ fn default_backoff_policy() -> Arc<ExponentialBackoff> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::keepalive::KEEPALIVE_PERIOD;
     use super::super::lease_state::tests::test_ids;
     use super::super::stub::tests::MockStub;
     use super::*;
@@ -268,8 +308,35 @@ mod tests {
         assert_eq!(recover_writes_rx.recv().await, Some(initial_request()));
 
         // Verify the stream performs keepalives, even if no messages have been yielded.
-        tokio::time::advance(KEEPALIVE_PERIOD).await;
+        // We need to keep the stream alive by sending heartbeats and polling them.
+        let (stop_tx, mut stop_rx) = mpsc::channel(1);
+        let polling_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_rx.recv() => break,
+                    res = stream.next_message() => {
+                        if res.is_err() || res.unwrap().is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+            stream
+        });
+
+        // Advance time in steps and send heartbeats to prevent timeout (15s)
+        for _ in 0..3 {
+            response_tx
+                .send(Ok(StreamingPullResponse::default()))
+                .await?;
+            tokio::time::advance(Duration::from_secs(10)).await;
+        }
+
         assert_eq!(recover_writes_rx.recv().await, Some(keepalive_request()));
+
+        // Stop polling and get stream back
+        let _ = stop_tx.send(()).await;
+        let mut stream = polling_handle.await?;
 
         // Verify the bidi nature of the stream.
         response_tx.send(Ok(test_response(1..10))).await?;

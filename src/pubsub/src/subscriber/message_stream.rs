@@ -1127,12 +1127,40 @@ mod tests {
         assert_eq!(initial_req.subscription, "projects/p/subscriptions/s");
 
         // Verify that we receive at least one keepalive request on the stream.
-        tokio::time::advance(KEEPALIVE_PERIOD).await;
+        // We need to keep the stream alive by sending heartbeats and polling them.
+        let (stop_tx, mut stop_rx) = channel(1);
+        let polling_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_rx.recv() => break,
+                    res = stream.next() => {
+                        if res.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+            stream
+        });
+
+        // Advance time in steps and send heartbeats to prevent timeout (15s)
+        for _ in 0..3 {
+            response_tx
+                .send(Ok(v1::StreamingPullResponse::default()))
+                .await?;
+            tokio::task::yield_now().await;
+            tokio::time::advance(KEEPALIVE_PERIOD / 3).await;
+        }
+
         let keepalive_req = recover_writes_rx
             .recv()
             .await
             .expect("should receive a keepalive request")?;
         assert_eq!(keepalive_req, v1::StreamingPullRequest::default());
+
+        // Stop polling and get stream back
+        let _ = stop_tx.send(()).await;
+        let mut stream = polling_handle.await?;
 
         // Drop the stream, which should signal a shutdown of the keepalive
         // task.
@@ -1903,6 +1931,41 @@ mod tests {
         assert_eq!(nack_req.subscription, "projects/p/subscriptions/s");
         assert_eq!(nack_req.ack_deadline_seconds, 0);
         assert_eq!(sorted(nack_req.ack_ids), test_ids(6..10));
+
+        Ok(())
+    }
+
+    #[tokio_test_no_panics(start_paused = true)]
+    async fn keepalive_timeout_reconnects() -> anyhow::Result<()> {
+        let (_response_tx1, response_rx1) = channel(10);
+        let (response_tx2, response_rx2) = channel(10);
+
+        let mut mock = MockSubscriber::new();
+        let mut seq = mockall::Sequence::new();
+
+        mock.expect_streaming_pull()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(move |_| Ok(TonicResponse::from(response_rx1)));
+
+        mock.expect_streaming_pull()
+            .times(1)
+            .in_sequence(&mut seq)
+            .return_once(move |_| Ok(TonicResponse::from(response_rx2)));
+
+        let (endpoint, _server) = start("0.0.0.0:0", mock).await?;
+        let client = test_client(endpoint).await?;
+        let mut stream = client.subscribe("projects/p/subscriptions/s").build();
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+
+        response_tx2.send(Ok(test_response(1..2))).await?;
+
+        let Some((m, h)) = stream.next().await.transpose()? else {
+            anyhow::bail!("expected message from reconnected stream")
+        };
+        assert_eq!(m.data, test_data(1));
+        h.ack();
 
         Ok(())
     }
