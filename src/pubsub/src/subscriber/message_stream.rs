@@ -328,7 +328,7 @@ impl MessageStreamImpl {
             StreamState::Closed => return None,
             StreamState::Active(s) => s,
         };
-        let timeout_token = stream.timeout_token.clone();
+        let timeout_token = stream.watchdog.timeout_token();
         tokio::select! {
             _ = timeout_token.cancelled() => {
                 let mut status = google_cloud_gax::error::rpc::Status::default();
@@ -338,8 +338,7 @@ impl MessageStreamImpl {
             }
             res = async { stream.next_message().await.map_err(to_gax_error).transpose() } => {
                 if let Some(Ok(_)) = &res {
-                    let now_secs = tokio::time::Instant::now().duration_since(stream.anchor).as_secs();
-                    stream.last_server_response_time.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                    stream.watchdog.record_response();
                 }
                 res
             }

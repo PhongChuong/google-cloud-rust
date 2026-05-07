@@ -32,8 +32,7 @@ pub(super) const KEEPALIVE_PERIOD: Duration = Duration::from_secs(30);
 pub(super) fn spawn(
     request_tx: Sender<StreamingPullRequest>,
     shutdown: CancellationToken,
-    last_client_ping_time: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    anchor: Instant,
+    watchdog: super::stream::StreamWatchdog,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut keepalive = interval_at(Instant::now() + KEEPALIVE_PERIOD, KEEPALIVE_PERIOD);
@@ -41,8 +40,7 @@ pub(super) fn spawn(
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = keepalive.tick() => {
-                    let now_secs = Instant::now().duration_since(anchor).as_secs();
-                    last_client_ping_time.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                    watchdog.record_ping();
                     let _ = request_tx.send(StreamingPullRequest::default()).await;
                 }
             }
@@ -54,7 +52,6 @@ pub(super) fn spawn(
 mod tests {
     use super::*;
     use google_cloud_test_macros::tokio_test_no_panics;
-    use std::sync::Arc;
     use tokio::sync::mpsc::channel;
 
     #[tokio_test_no_panics(start_paused = true)]
@@ -65,8 +62,7 @@ mod tests {
         let _handle = spawn(
             request_tx,
             shutdown,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            start,
+            super::super::stream::StreamWatchdog::new(),
         );
 
         // Wait for the first keepalive
@@ -93,8 +89,7 @@ mod tests {
         let handle = spawn(
             request_tx,
             shutdown.clone(),
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            start,
+            super::super::stream::StreamWatchdog::new(),
         );
 
         // Wait for the first keepalive

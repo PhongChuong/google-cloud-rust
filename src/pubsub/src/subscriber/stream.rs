@@ -32,6 +32,51 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 pub(super) const INITIAL_DELAY: Duration = Duration::from_millis(100);
 pub(super) const MAXIMUM_DELAY: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Debug)]
+pub(super) struct StreamWatchdog {
+    anchor: Instant,
+    last_client_ping_time: Arc<std::sync::atomic::AtomicU64>,
+    last_server_response_time: Arc<std::sync::atomic::AtomicU64>,
+    timeout_token: CancellationToken,
+}
+
+impl StreamWatchdog {
+    pub fn new() -> Self {
+        Self {
+            anchor: Instant::now(),
+            last_client_ping_time: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_server_response_time: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            timeout_token: CancellationToken::new(),
+        }
+    }
+
+    pub fn record_ping(&self) {
+        let now_secs = Instant::now().duration_since(self.anchor).as_secs();
+        self.last_client_ping_time.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_response(&self) {
+        let now_secs = Instant::now().duration_since(self.anchor).as_secs();
+        self.last_server_response_time.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn has_timed_out(&self) -> bool {
+        let ping = self.last_client_ping_time.load(std::sync::atomic::Ordering::Relaxed);
+        let resp = self.last_server_response_time.load(std::sync::atomic::Ordering::Relaxed);
+        let current_time = Instant::now().duration_since(self.anchor).as_secs();
+        
+        ping > resp && (current_time >= ping && current_time - ping >= 15)
+    }
+
+    pub fn cancel(&self) {
+        self.timeout_token.cancel();
+    }
+
+    pub fn timeout_token(&self) -> CancellationToken {
+        self.timeout_token.clone()
+    }
+}
+
 /// Representation for the `StreamingPull` RPC.
 #[derive(Debug)]
 pub(super) struct Stream<T>
@@ -46,10 +91,7 @@ where
     /// The stream.
     pub(super) stream: <T as Stub>::Stream,
 
-    pub(super) last_client_ping_time: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) last_server_response_time: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) anchor: Instant,
-    pub(super) timeout_token: CancellationToken,
+    pub(super) watchdog: StreamWatchdog,
 }
 
 impl<T> TonicStreaming for Stream<T>
@@ -120,22 +162,16 @@ where
     // being idle for ~90s, leading to unnecessary retries.
     //
     // [^1]: https://github.com/hyperium/tonic/issues/515
-    let anchor = Instant::now();
-    let last_client_ping_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let last_server_response_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let timeout_token = CancellationToken::new();
-
+    let watchdog = StreamWatchdog::new();
     let shutdown = CancellationToken::new();
+    
     keepalive::spawn(
         request_tx,
         shutdown.clone(),
-        last_client_ping_time.clone(),
-        anchor,
+        watchdog.clone(),
     );
 
-    let last_client_ping = last_client_ping_time.clone();
-    let last_server_resp = last_server_response_time.clone();
-    let timeout_tok = timeout_token.clone();
+    let watchdog_clone = watchdog.clone();
     let monitor_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -143,11 +179,8 @@ where
             tokio::select! {
                 _ = monitor_shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    let ping = last_client_ping.load(std::sync::atomic::Ordering::Relaxed);
-                    let resp = last_server_resp.load(std::sync::atomic::Ordering::Relaxed);
-                    let current_time = Instant::now().duration_since(anchor).as_secs();
-                    if ping > resp && (current_time >= ping && current_time - ping >= 15) {
-                        timeout_tok.cancel();
+                    if watchdog_clone.has_timed_out() {
+                        watchdog_clone.cancel();
                         break;
                     }
                 }
@@ -163,10 +196,7 @@ where
     Ok(Stream {
         _keepalive_guard: shutdown.drop_guard(),
         stream,
-        last_client_ping_time,
-        last_server_response_time,
-        anchor,
-        timeout_token,
+        watchdog,
     })
 }
 
