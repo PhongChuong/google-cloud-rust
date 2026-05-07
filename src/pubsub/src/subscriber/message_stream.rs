@@ -32,6 +32,8 @@ use gaxi::prost::FromProto as _;
 use google_cloud_gax::retry_result::RetryResult;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
 use tokio::sync::oneshot::Receiver;
 use tokio::time::Duration;
@@ -114,6 +116,12 @@ pub struct MessageStreamImpl {
 
     /// A token that can initiate shutdown after a stream error.
     shutdown: CancellationToken,
+
+    /// Tracking server response timestamps.
+    last_response_time: Arc<AtomicU64>,
+
+    /// A token that can forcefully close the current stream on timeout.
+    current_stream_shutdown: Option<CancellationToken>,
 }
 
 // We would rather always allocate enough space to hold the stream on the stack
@@ -178,6 +186,13 @@ impl MessageStream {
             message_tx,
             ack_tx,
             shutdown: shutdown.clone(),
+            last_response_time: Arc::new(AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )),
+            current_stream_shutdown: None,
         };
         Self {
             inner,
@@ -291,6 +306,9 @@ impl MessageStreamImpl {
                     RetryResult::Continue(_) => {
                         // The stream failed with a transient error. Reset the stream.
                         self.stream = None;
+                        if let Some(cancel) = self.current_stream_shutdown.take() {
+                            cancel.cancel();
+                        }
                         continue;
                     }
                     RetryResult::Permanent(e) | RetryResult::Exhausted(e) => {
@@ -306,6 +324,41 @@ impl MessageStreamImpl {
     /// Make a new attempt to open the underlying gRPC stream.
     async fn open_stream(&mut self) -> Result<()> {
         let stream = Stream::<Transport>::new(self.stub.clone(), self.initial_req.clone()).await?;
+
+        let cancel = CancellationToken::new();
+        self.current_stream_shutdown = Some(cancel.clone());
+
+        let last_response_time = self.last_response_time.clone();
+
+        // Initialize with current time so we don't immediately timeout
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        last_response_time.store(now, Ordering::Relaxed);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let last = last_response_time.load(Ordering::Relaxed);
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        if now - last > 15 {
+                            cancel.cancel();
+                            break;
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        break;
+                    }
+                }
+            }
+        });
+
         self.stream = Some(StreamState::Active(stream));
         Ok(())
     }
@@ -328,11 +381,29 @@ impl MessageStreamImpl {
             StreamState::Closed => return None,
             StreamState::Active(s) => s,
         };
-        stream
-            .next_message()
-            .await
-            .map_err(to_gax_error)
-            .transpose()
+
+        let cancel = self.current_stream_shutdown.clone()?;
+
+        let next_msg = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Some(Err(Error::io("Stream keepalive timeout")));
+            }
+            res = stream.next_message() => res,
+        };
+
+        match next_msg {
+            Ok(Some(resp)) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                self.last_response_time.store(now, Ordering::Relaxed);
+                Some(Ok(resp))
+            }
+            Ok(None) => None,
+            Err(e) => Some(Err(to_gax_error(e))),
+        }
     }
 
     /// Populate the message pool by reading from the stream.
@@ -407,6 +478,9 @@ impl MessageStreamImpl {
         self.stream = Some(StreamState::Closed);
         self.pool.clear();
         self.shutdown.cancel();
+        if let Some(cancel) = self.current_stream_shutdown.take() {
+            cancel.cancel();
+        }
     }
 }
 
