@@ -18,7 +18,7 @@ use super::stub::{Stub, TonicStreaming};
 use crate::RequestOptions;
 use crate::google::pubsub::v1::{StreamingPullRequest, StreamingPullResponse};
 use crate::{Error, Result};
-use gaxi::grpc::tonic::Result as TonicResult;
+use gaxi::grpc::tonic::{Code as TonicCode, Result as TonicResult, Status as TonicStatus};
 use google_cloud_gax::backoff_policy::BackoffPolicy;
 use google_cloud_gax::exponential_backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
 use google_cloud_gax::retry_loop_internal::retry_loop;
@@ -30,6 +30,8 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub(super) const INITIAL_DELAY: Duration = Duration::from_millis(100);
 pub(super) const MAXIMUM_DELAY: Duration = Duration::from_secs(60);
+pub(super) const SERVER_KEEP_ALIVE_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
+pub(super) const SERVER_KEEP_ALIVE_TIMEOUT_DURATION: Duration = Duration::from_secs(15);
 
 /// Representation for the `StreamingPull` RPC.
 #[derive(Debug)]
@@ -44,6 +46,12 @@ where
 
     /// The stream.
     pub(super) stream: <T as Stub>::Stream,
+
+    /// Token cancelled when the server fails to respond within the keepalive window.
+    timeout_token: CancellationToken,
+
+    /// Shared timestamp of the last received response.
+    last_response: Arc<Mutex<tokio::time::Instant>>,
 }
 
 impl<T> TonicStreaming for Stream<T>
@@ -52,7 +60,20 @@ where
     <T as Stub>::Stream: TonicStreaming,
 {
     async fn next_message(&mut self) -> TonicResult<Option<StreamingPullResponse>> {
-        self.stream.next_message().await
+        tokio::select! {
+            _ = self.timeout_token.cancelled() => {
+                Err(TonicStatus::new(
+                    TonicCode::Unavailable,
+                    "server keepalive timeout",
+                ))
+            }
+            res = self.stream.next_message() => {
+                if let Ok(Some(_)) = &res {
+                    *self.last_response.lock().unwrap_or_else(|e| e.into_inner()) = tokio::time::Instant::now();
+                }
+                res
+            }
+        }
     }
 }
 
@@ -122,9 +143,39 @@ where
         .await?
         .into_inner();
 
+    let timeout_token = CancellationToken::new();
+    let last_response = Arc::new(Mutex::new(tokio::time::Instant::now()));
+
+    {
+        let last_response = last_response.clone();
+        let shutdown = shutdown.clone();
+        let timeout_token = timeout_token.clone();
+        tokio::spawn(async move {
+            loop {
+                let elapsed = {
+                    let guard = last_response.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.elapsed()
+                };
+
+                // Signal a keepalive timeout if no response has been received within the timeout window.
+                if elapsed >= SERVER_KEEP_ALIVE_TIMEOUT_DURATION {
+                    timeout_token.cancel();
+                    break;
+                }
+
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(SERVER_KEEP_ALIVE_MONITOR_INTERVAL) => {}
+                }
+            }
+        });
+    }
+
     Ok(Stream {
         _keepalive_guard: shutdown.drop_guard(),
         stream,
+        timeout_token,
+        last_response,
     })
 }
 
@@ -267,11 +318,21 @@ mod tests {
         // Verify the stream is seeded with the initial request.
         assert_eq!(recover_writes_rx.recv().await, Some(initial_request()));
 
-        // Verify the stream performs keepalives, even if no messages have been yielded.
-        tokio::time::advance(KEEPALIVE_PERIOD).await;
+        // Advance time until stream performs keepalives.
+        // To prevent the server keepalive monitor from timing out the stream,
+        // we advance time by SERVER_KEEP_ALIVE_MONITOR_INTERVAL and periodically
+        // yield server responses until KEEPALIVE_PERIOD.
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < KEEPALIVE_PERIOD {
+            tokio::time::advance(SERVER_KEEP_ALIVE_MONITOR_INTERVAL).await;
+            response_tx.send(Ok(test_response(0..0))).await?;
+            stream.next_message().await?;
+        }
+
+        // Verify the stream performs keepalives.
         assert_eq!(recover_writes_rx.recv().await, Some(keepalive_request()));
 
-        // Verify the bidi nature of the stream.
+        // Verify the bidi nature of the stream continues.
         response_tx.send(Ok(test_response(1..10))).await?;
         assert_eq!(stream.next_message().await?, Some(test_response(1..10)));
 
@@ -398,6 +459,58 @@ mod tests {
             google_cloud_gax::error::rpc::Code::FailedPrecondition
         );
         assert_eq!(status.message, "fail");
+
+        Ok(())
+    }
+
+    #[tokio_test_no_panics(start_paused = true)]
+    async fn server_keepalive_timeout() -> anyhow::Result<()> {
+        let (_response_tx, response_rx) = mpsc::channel(10);
+        let mut mock = MockStub::new();
+        mock.expect_streaming_pull()
+            .withf(|s, _, _| s == "subscription=projects/my-project/subscriptions/my-subscription")
+            .times(1)
+            .return_once(move |_s, _r, _o| Ok(TonicResponse::from(response_rx)));
+
+        let mut stream = open_stream(Arc::new(mock), initial_request()).await?;
+
+        // Advance time beyond the server keepalive timeout duration
+        tokio::time::advance(SERVER_KEEP_ALIVE_TIMEOUT_DURATION + Duration::from_secs(1)).await;
+
+        let res = stream.next_message().await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.code(), TonicCode::Unavailable);
+        assert_eq!(err.message(), "server keepalive timeout");
+
+        Ok(())
+    }
+
+    #[tokio_test_no_panics(start_paused = true)]
+    async fn server_keepalive_timeout_reset() -> anyhow::Result<()> {
+        let (response_tx, response_rx) = mpsc::channel(10);
+        let mut mock = MockStub::new();
+        mock.expect_streaming_pull()
+            .withf(|s, _, _| s == "subscription=projects/my-project/subscriptions/my-subscription")
+            .times(1)
+            .return_once(move |_s, _r, _o| Ok(TonicResponse::from(response_rx)));
+
+        let mut stream = open_stream(Arc::new(mock), initial_request()).await?;
+
+        // Advance time by less than timeout
+        tokio::time::advance(SERVER_KEEP_ALIVE_TIMEOUT_DURATION - Duration::from_secs(1)).await;
+
+        // Send and receive a message to reset the last_response timestamp
+        response_tx.send(Ok(test_response(1..10))).await?;
+        assert_eq!(stream.next_message().await?, Some(test_response(1..10)));
+
+        // Advance time again by an amount that would have exceeded the original timeout,
+        // but is within the new timeout window.
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        // Send another message to confirm the stream is still alive and has not timed out
+        response_tx.send(Ok(test_response(11..20))).await?;
+        assert_eq!(stream.next_message().await?, Some(test_response(11..20)));
 
         Ok(())
     }
