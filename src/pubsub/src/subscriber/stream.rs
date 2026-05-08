@@ -44,6 +44,12 @@ where
 
     /// The stream.
     pub(super) stream: <T as Stub>::Stream,
+
+    /// Token cancelled when server response times out.
+    timeout_token: CancellationToken,
+
+    /// Shared timestamp of the last received response.
+    last_response: Arc<Mutex<tokio::time::Instant>>,
 }
 
 impl<T> TonicStreaming for Stream<T>
@@ -52,7 +58,20 @@ where
     <T as Stub>::Stream: TonicStreaming,
 {
     async fn next_message(&mut self) -> TonicResult<Option<StreamingPullResponse>> {
-        self.stream.next_message().await
+        tokio::select! {
+            _ = self.timeout_token.cancelled() => {
+                Err(gaxi::grpc::tonic::Status::new(
+                    gaxi::grpc::tonic::Code::Unavailable,
+                    "server timeout",
+                ))
+            }
+            res = self.stream.next_message() => {
+                if let Ok(Some(_)) = &res {
+                    *self.last_response.lock().unwrap() = tokio::time::Instant::now();
+                }
+                res
+            }
+        }
     }
 }
 
@@ -122,9 +141,41 @@ where
         .await?
         .into_inner();
 
+    let timeout_token = CancellationToken::new();
+    let timeout = keepalive::KEEPALIVE_PERIOD + Duration::from_secs(15);
+    let last_response = Arc::new(Mutex::new(tokio::time::Instant::now()));
+
+    {
+        let last_response = last_response.clone();
+        let shutdown = shutdown.clone();
+        let timeout_token = timeout_token.clone();
+        tokio::spawn(async move {
+            loop {
+                let now = tokio::time::Instant::now();
+                let elapsed = {
+                    let guard = last_response.lock().unwrap();
+                    now.saturating_duration_since(*guard)
+                };
+
+                if elapsed >= timeout {
+                    timeout_token.cancel();
+                    break;
+                }
+
+                let sleep_duration = timeout - elapsed;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(sleep_duration) => {}
+                }
+            }
+        });
+    }
+
     Ok(Stream {
         _keepalive_guard: shutdown.drop_guard(),
         stream,
+        timeout_token,
+        last_response,
     })
 }
 
@@ -398,6 +449,29 @@ mod tests {
             google_cloud_gax::error::rpc::Code::FailedPrecondition
         );
         assert_eq!(status.message, "fail");
+
+        Ok(())
+    }
+
+    #[tokio_test_no_panics(start_paused = true)]
+    async fn timeout() -> anyhow::Result<()> {
+        let (_response_tx, response_rx) = mpsc::channel(10);
+        let mut mock = MockStub::new();
+        mock.expect_streaming_pull()
+            .withf(|s, _, _| s == "subscription=projects/my-project/subscriptions/my-subscription")
+            .times(1)
+            .return_once(move |_s, _r, _o| Ok(TonicResponse::from(response_rx)));
+
+        let mut stream = open_stream(Arc::new(mock), initial_request()).await?;
+
+        // Advance time beyond KEEPALIVE_PERIOD + Duration::from_secs(15)
+        tokio::time::advance(KEEPALIVE_PERIOD + Duration::from_secs(16)).await;
+
+        let res = stream.next_message().await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.code(), gaxi::grpc::tonic::Code::Unavailable);
+        assert_eq!(err.message(), "server timeout");
 
         Ok(())
     }
