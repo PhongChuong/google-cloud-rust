@@ -475,4 +475,34 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio_test_no_panics(start_paused = true)]
+    async fn timeout_reset() -> anyhow::Result<()> {
+        let (response_tx, response_rx) = mpsc::channel(10);
+        let mut mock = MockStub::new();
+        mock.expect_streaming_pull()
+            .withf(|s, _, _| s == "subscription=projects/my-project/subscriptions/my-subscription")
+            .times(1)
+            .return_once(move |_s, _r, _o| Ok(TonicResponse::from(response_rx)));
+
+        let mut stream = open_stream(Arc::new(mock), initial_request()).await?;
+
+        // Advance time by less than timeout
+        let timeout_duration = KEEPALIVE_PERIOD + Duration::from_secs(15);
+        tokio::time::advance(timeout_duration - Duration::from_secs(5)).await;
+
+        // Send and receive a message to reset the last_response timestamp
+        response_tx.send(Ok(test_response(1..10))).await?;
+        assert_eq!(stream.next_message().await?, Some(test_response(1..10)));
+
+        // Advance time again by an amount that would have exceeded the original timeout,
+        // but is within the new timeout window.
+        tokio::time::advance(Duration::from_secs(10)).await;
+
+        // Send another message to confirm the stream is still alive and has not timed out
+        response_tx.send(Ok(test_response(11..20))).await?;
+        assert_eq!(stream.next_message().await?, Some(test_response(11..20)));
+
+        Ok(())
+    }
 }
