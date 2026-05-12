@@ -33,3 +33,4 @@ mod shutdown_token;
 mod stream;
 mod stub;
 mod transport;
+mod watchdog;
