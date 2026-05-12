@@ -44,6 +44,9 @@ where
 
     /// The stream.
     pub(super) stream: <T as Stub>::Stream,
+
+    last_response: Arc<Mutex<tokio::time::Instant>>,
+    watchdog_cancel: CancellationToken,
 }
 
 impl<T> TonicStreaming for Stream<T>
@@ -52,7 +55,15 @@ where
     <T as Stub>::Stream: TonicStreaming,
 {
     async fn next_message(&mut self) -> TonicResult<Option<StreamingPullResponse>> {
-        self.stream.next_message().await
+        tokio::select! {
+            res = self.stream.next_message() => {
+                *self.last_response.lock().unwrap() = tokio::time::Instant::now();
+                res
+            }
+            _ = self.watchdog_cancel.cancelled() => {
+                Err(gaxi::grpc::tonic::Status::unavailable("watchdog timeout"))
+            }
+        }
     }
 }
 
@@ -115,7 +126,14 @@ where
     //
     // [^1]: https://github.com/hyperium/tonic/issues/515
     let shutdown = CancellationToken::new();
-    keepalive::spawn(request_tx, shutdown.clone());
+    let last_response = Arc::new(Mutex::new(tokio::time::Instant::now()));
+    let watchdog_cancel = CancellationToken::new();
+    keepalive::spawn(
+        request_tx,
+        shutdown.clone(),
+        last_response.clone(),
+        watchdog_cancel.clone(),
+    );
 
     let stream = inner
         .streaming_pull(&request_params, request_rx, RequestOptions::default())
@@ -125,6 +143,8 @@ where
     Ok(Stream {
         _keepalive_guard: shutdown.drop_guard(),
         stream,
+        last_response,
+        watchdog_cancel,
     })
 }
 
